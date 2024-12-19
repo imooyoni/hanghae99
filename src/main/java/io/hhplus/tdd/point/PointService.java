@@ -7,7 +7,6 @@ import org.springframework.stereotype.Service;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
 @Service
@@ -16,7 +15,7 @@ public class PointService {
     private final PointHistoryTable pointHistoryTable;
 
     // 유저 단위 Lock을 관리하기 위한 Map
-    private final Map<Long, Lock> userLocks = new ConcurrentHashMap<>();
+    private final Map<Long, ReentrantLock> userLocks = new ConcurrentHashMap<>();
 
     public PointService(UserPointTable userPointTable, PointHistoryTable pointHistoryTable) {
         this.userPointTable = userPointTable;
@@ -42,46 +41,51 @@ public class PointService {
     }
 
     /**
-     * charge or use point
-     * 잔고가 부족할 경우 포인트 사용 실패
-     * @param id        사용자 ID
-     * @param amount    포인트 금액
-     * @param transactionCode 1=charge, 2=use
-     * @return UserPoint
+     * 포인트를 충전하거나 사용합니다.
+     * @param id 사용자 ID
+     * @param amount 포인트 금액 (양수)
+     * @param type 트랜잭션 타입 (CHARGE 또는 USE)
+     * @return 업데이트된 UserPoint
+     * @throws IllegalArgumentException amount가 0 이하인 경우
+     * @throws RuntimeException 잔액 부족으로 실패시
      */
-    public UserPoint chargeOrUsePoint(long id, long amount, long transactionCode) {
-        Lock lock = userLocks.computeIfAbsent(id, key -> new ReentrantLock());
+    public UserPoint chargeOrUsePoint(long id, long amount, TransactionType type) {
+        validateAmount(amount);
 
+        ReentrantLock lock = userLocks.computeIfAbsent(id, key -> new ReentrantLock());
         lock.lock();
 
         try {
-            // 현재 포인트 조회
-            long currentPoint = userPointTable.selectById(id).point();
+            UserPoint currentUserPoint = userPointTable.selectById(id);
+            long updatedPoint = calculateUpdatedPoint(currentUserPoint.point(), amount, type);
 
-            if (transactionCode == 1) { // 포인트 충전
-                long updatedPoint = currentPoint + amount;
+            UserPoint updatedUserPoint = userPointTable.insertOrUpdate(id, updatedPoint);
+            pointHistoryTable.insert(id, amount, type, System.currentTimeMillis());
 
-                // 업데이트 및 히스토리 기록
-                UserPoint updatedUserPoint = userPointTable.insertOrUpdate(id, updatedPoint);
-                pointHistoryTable.insert(id, amount, TransactionType.CHARGE, System.currentTimeMillis());
-                return updatedUserPoint;
+            return updatedUserPoint;
+        } finally {
+            lock.unlock();
+            if (!lock.hasQueuedThreads()) {
+                userLocks.remove(id);
+            }
+        }
+    }
 
-            } else if (transactionCode == 2) { // 포인트 사용
+    private void validateAmount(long amount) {
+        if (amount <= 0) {
+            throw new IllegalArgumentException("Amount must be greater than 0");
+        }
+    }
+
+    private long calculateUpdatedPoint(long currentPoint, long amount, TransactionType type) {
+        return switch (type) {
+            case CHARGE -> currentPoint + amount;
+            case USE -> {
                 if (currentPoint < amount) {
                     throw new RuntimeException("Point usage failed (999: Insufficient remaining points)");
                 }
-                long updatedPoint = currentPoint - amount;
-
-                // 업데이트 및 히스토리 기록
-                UserPoint updatedUserPoint = userPointTable.insertOrUpdate(id, updatedPoint);
-                pointHistoryTable.insert(id, amount, TransactionType.USE, System.currentTimeMillis());
-                return updatedUserPoint;
-
-            } else {
-                throw new RuntimeException("transactionCode is invalid");
+                yield currentPoint - amount;
             }
-        } finally {
-            lock.unlock(); // Lock 해제
-        }
+        };
     }
 }
